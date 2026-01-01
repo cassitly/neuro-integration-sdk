@@ -23,6 +23,8 @@ type Message struct {
 }
 
 // ActionSchema represents a JSON schema for action parameters
+// Note: Must have Type "object" if provided. Many JSON schema keywords are not supported.
+// See: https://github.com/VedalAI/neuro-sdk/blob/main/API/SPECIFICATION.md#action
 type ActionSchema struct {
 	Type       string                 `json:"type"`
 	Properties map[string]interface{} `json:"properties,omitempty"`
@@ -38,9 +40,10 @@ type ActionDefinition struct {
 
 // IncomingAction represents an action sent by Neuro
 type IncomingAction struct {
-	ID   string          `json:"id"`
-	Name string          `json:"name"`
-	Data json.RawMessage `json:"data,omitempty"`
+	ID   string `json:"id"`
+	Name string `json:"name"`
+	// Data is JSON-stringified action parameters (not raw JSON)
+	Data string `json:"data,omitempty"`
 }
 
 // ExecutionResult represents the result of validating/executing an action
@@ -72,14 +75,18 @@ const (
 // Action Handler Interface
 
 // ActionHandler defines the interface for handling actions
+// Important: Neuro can call actions at any time after registration,
+// even before you send an action force. Always be prepared to handle actions.
 type ActionHandler interface {
 	// GetName returns the unique identifier for this action
 	GetName() string
 	// GetDescription returns a description of what this action does
 	GetDescription() string
 	// GetSchema returns the JSON schema for action parameters (can be nil)
+	// If provided, schema must have Type "object"
 	GetSchema() *ActionSchema
 	// Validate checks if the incoming action data is valid
+	// Data comes directly from Neuro and may be malformed - always validate!
 	Validate(data json.RawMessage) (state interface{}, result ExecutionResult)
 	// Execute performs the actual action using the validated state
 	Execute(state interface{})
@@ -89,32 +96,32 @@ type ActionHandler interface {
 
 // ClientConfig holds configuration for the Neuro client
 type ClientConfig struct {
-	Game       string
+	Game         string
 	WebsocketURL string
-	Logger     *log.Logger
+	Logger       *log.Logger
 }
 
 // Client
 
 // Client manages the websocket connection to Neuro
 type Client struct {
-	config   ClientConfig
-	conn     *websocket.Conn
-	connMu   sync.RWMutex
-	
+	config ClientConfig
+	conn   *websocket.Conn
+	connMu sync.RWMutex
+
 	// Registered actions
 	actions   map[string]ActionHandler
 	actionsMu sync.RWMutex
-	
+
 	// Channels
 	actionChan chan IncomingAction
 	errChan    chan error
 	closeChan  chan struct{}
-	
+
 	// State
 	connected bool
 	closed    bool
-	
+
 	logger *log.Logger
 }
 
@@ -126,7 +133,7 @@ func NewClient(config ClientConfig) (*Client, error) {
 	if config.WebsocketURL == "" {
 		return nil, errors.New("websocket URL is required")
 	}
-	
+
 	c := &Client{
 		config:     config,
 		actions:    make(map[string]ActionHandler),
@@ -135,11 +142,11 @@ func NewClient(config ClientConfig) (*Client, error) {
 		closeChan:  make(chan struct{}),
 		logger:     config.Logger,
 	}
-	
+
 	if c.logger == nil {
 		c.logger = log.Default()
 	}
-	
+
 	return c, nil
 }
 
@@ -147,35 +154,35 @@ func NewClient(config ClientConfig) (*Client, error) {
 func (c *Client) Connect() error {
 	c.connMu.Lock()
 	defer c.connMu.Unlock()
-	
+
 	if c.closed {
 		return errors.New("client is closed")
 	}
 	if c.connected {
 		return errors.New("already connected")
 	}
-	
+
 	u, err := url.Parse(c.config.WebsocketURL)
 	if err != nil {
 		return fmt.Errorf("invalid websocket URL: %w", err)
 	}
-	
+
 	conn, _, err := websocket.DefaultDialer.Dial(u.String(), nil)
 	if err != nil {
 		return fmt.Errorf("failed to connect: %w", err)
 	}
-	
+
 	c.conn = conn
 	c.connected = true
-	
+
 	// Start reader goroutine
 	go c.readLoop()
-	
+
 	// Send startup message
 	if err := c.Startup(); err != nil {
 		c.logger.Printf("Failed to send startup message: %v", err)
 	}
-	
+
 	return nil
 }
 
@@ -194,7 +201,7 @@ func (c *Client) readLoop() {
 				}
 				return
 			}
-			
+
 			if err := c.handleMessage(msgBytes); err != nil {
 				c.logger.Printf("Error handling message: %v", err)
 			}
@@ -207,27 +214,27 @@ func (c *Client) handleMessage(msgBytes []byte) error {
 	if err := json.Unmarshal(msgBytes, &msg); err != nil {
 		return fmt.Errorf("failed to parse message: %w", err)
 	}
-	
+
 	c.logger.Printf("Received: %s", msg.Command)
-	
+
 	switch msg.Command {
 	case "action":
 		var action IncomingAction
 		if err := json.Unmarshal(msg.Data, &action); err != nil {
 			return fmt.Errorf("failed to parse action data: %w", err)
 		}
-		
+
 		// Handle action in goroutine to avoid blocking the read loop
 		go c.handleAction(action)
-		
+
 	case "actions/reregister_all":
 		// Resend all registered actions
 		go c.resendRegisteredActions()
-		
+
 	default:
 		c.logger.Printf("Unhandled command: %s", msg.Command)
 	}
-	
+
 	return nil
 }
 
@@ -235,20 +242,31 @@ func (c *Client) handleAction(action IncomingAction) {
 	c.actionsMu.RLock()
 	handler, exists := c.actions[action.Name]
 	c.actionsMu.RUnlock()
-	
+
 	if !exists {
 		c.SendActionResult(action.ID, false, fmt.Sprintf("Unknown action: %s", action.Name))
 		return
 	}
-	
-	// Validate
-	state, result := handler.Validate(action.Data)
-	
+
+	// Parse the JSON-stringified data from Neuro
+	var actionData json.RawMessage
+	if action.Data != "" {
+		// Data comes as a JSON string, need to parse it
+		if err := json.Unmarshal([]byte(action.Data), &actionData); err != nil {
+			c.logger.Printf("Failed to parse action data JSON: %v", err)
+			c.SendActionResult(action.ID, false, "Invalid JSON in action data")
+			return
+		}
+	}
+
+	// Validate (data may be malformed or not match schema)
+	state, result := handler.Validate(actionData)
+
 	// Send result immediately after validation
 	if err := c.SendActionResult(action.ID, result.Successful, result.Message); err != nil {
 		c.logger.Printf("Failed to send action result: %v", err)
 	}
-	
+
 	// Execute if successful
 	if result.Successful {
 		handler.Execute(state)
@@ -260,22 +278,22 @@ func (c *Client) handleAction(action IncomingAction) {
 func (c *Client) send(msg Message) error {
 	c.connMu.RLock()
 	defer c.connMu.RUnlock()
-	
+
 	if !c.connected {
 		return errors.New("not connected")
 	}
-	
+
 	msg.Game = c.config.Game
-	
+
 	msgBytes, err := json.Marshal(msg)
 	if err != nil {
 		return fmt.Errorf("failed to marshal message: %w", err)
 	}
-	
+
 	if err := c.conn.WriteMessage(websocket.TextMessage, msgBytes); err != nil {
 		return fmt.Errorf("failed to send message: %w", err)
 	}
-	
+
 	c.logger.Printf("Sent: %s", msg.Command)
 	return nil
 }
@@ -292,11 +310,16 @@ func (c *Client) SendContext(message string, silent bool) error {
 		"silent":  silent,
 	}
 	dataBytes, _ := json.Marshal(data)
-	
+
 	return c.send(Message{
 		Command: "context",
 		Data:    dataBytes,
 	})
+}
+
+// SendShutdownReady notifies Neuro that the integration is ready to shut down
+func (c *Client) SendShutdownReady() error {
+	return c.send(Message{Command: "shutdown/ready"})
 }
 
 // Action Management
@@ -311,31 +334,31 @@ func (c *Client) RegisterActions(handlers []ActionHandler) error {
 	if len(handlers) == 0 {
 		return nil
 	}
-	
+
 	c.actionsMu.Lock()
 	defer c.actionsMu.Unlock()
-	
+
 	actions := make([]ActionDefinition, 0, len(handlers))
 	for _, h := range handlers {
 		name := h.GetName()
 		if name == "" {
 			return errors.New("action name cannot be empty")
 		}
-		
+
 		c.actions[name] = h
-		
+
 		actions = append(actions, ActionDefinition{
 			Name:        name,
 			Description: h.GetDescription(),
 			Schema:      h.GetSchema(),
 		})
 	}
-	
+
 	data := map[string]interface{}{
 		"actions": actions,
 	}
 	dataBytes, _ := json.Marshal(data)
-	
+
 	return c.send(Message{
 		Command: "actions/register",
 		Data:    dataBytes,
@@ -352,19 +375,19 @@ func (c *Client) UnregisterActions(names []string) error {
 	if len(names) == 0 {
 		return nil
 	}
-	
+
 	c.actionsMu.Lock()
 	defer c.actionsMu.Unlock()
-	
+
 	for _, name := range names {
 		delete(c.actions, name)
 	}
-	
+
 	data := map[string]interface{}{
 		"action_names": names,
 	}
 	dataBytes, _ := json.Marshal(data)
-	
+
 	return c.send(Message{
 		Command: "actions/unregister",
 		Data:    dataBytes,
@@ -378,7 +401,7 @@ func (c *Client) resendRegisteredActions() {
 		handlers = append(handlers, h)
 	}
 	c.actionsMu.RUnlock()
-	
+
 	if len(handlers) > 0 {
 		if err := c.RegisterActions(handlers); err != nil {
 			c.logger.Printf("Failed to resend registered actions: %v", err)
@@ -391,29 +414,29 @@ func (c *Client) ForceActions(query string, actionNames []string, opts ...ForceO
 	if len(actionNames) == 0 {
 		return errors.New("must specify at least one action name")
 	}
-	
+
 	config := &forceConfig{
-		priority:          PriorityLow,
-		ephemeralContext:  false,
+		priority:         PriorityLow,
+		ephemeralContext: false,
 	}
-	
+
 	for _, opt := range opts {
 		opt(config)
 	}
-	
+
 	data := map[string]interface{}{
-		"query":              query,
-		"action_names":       actionNames,
-		"ephemeral_context":  config.ephemeralContext,
-		"priority":           config.priority,
+		"query":             query,
+		"action_names":      actionNames,
+		"ephemeral_context": config.ephemeralContext,
+		"priority":          config.priority,
 	}
-	
+
 	if config.state != "" {
 		data["state"] = config.state
 	}
-	
+
 	dataBytes, _ := json.Marshal(data)
-	
+
 	return c.send(Message{
 		Command: "actions/force",
 		Data:    dataBytes,
@@ -458,7 +481,7 @@ func (c *Client) SendActionResult(id string, success bool, message string) error
 		"message": message,
 	}
 	dataBytes, _ := json.Marshal(data)
-	
+
 	return c.send(Message{
 		Command: "action/result",
 		Data:    dataBytes,
@@ -482,24 +505,25 @@ func (c *Client) Errors() <-chan error {
 func (c *Client) Close() error {
 	c.connMu.Lock()
 	defer c.connMu.Unlock()
-	
+
 	if c.closed {
 		return nil
 	}
-	
+
 	c.closed = true
 	close(c.closeChan)
-	
+
 	if c.conn != nil {
 		return c.conn.Close()
 	}
-	
+
 	return nil
 }
 
 // Helper Functions
 
 // WrapSchema wraps properties into a proper JSON schema object
+// The resulting schema will have Type "object" as required by the Neuro API
 func WrapSchema(properties map[string]interface{}, required []string) *ActionSchema {
 	return &ActionSchema{
 		Type:       "object",
@@ -509,6 +533,7 @@ func WrapSchema(properties map[string]interface{}, required []string) *ActionSch
 }
 
 // ParseActionData is a helper to parse action data into a struct
+// Note: Data from Neuro may be malformed - always check the error
 func ParseActionData(data json.RawMessage, v interface{}) error {
 	if len(data) == 0 {
 		return nil
@@ -520,12 +545,12 @@ func ParseActionData(data json.RawMessage, v interface{}) error {
 
 // ActionWindow represents a temporary set of actions that will be forced
 type ActionWindow struct {
-	client    *Client
-	actions   []ActionHandler
-	forceOpts []ForceOption
-	query     string
+	client     *Client
+	actions    []ActionHandler
+	forceOpts  []ForceOption
+	query      string
 	registered bool
-	mu        sync.Mutex
+	mu         sync.Mutex
 }
 
 // NewActionWindow creates a new action window
@@ -540,12 +565,12 @@ func (c *Client) NewActionWindow() *ActionWindow {
 func (w *ActionWindow) AddAction(handler ActionHandler) *ActionWindow {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	
+
 	if w.registered {
 		w.client.logger.Printf("Cannot add action to registered window")
 		return w
 	}
-	
+
 	w.actions = append(w.actions, handler)
 	return w
 }
@@ -554,12 +579,12 @@ func (w *ActionWindow) AddAction(handler ActionHandler) *ActionWindow {
 func (w *ActionWindow) SetForce(query string, opts ...ForceOption) *ActionWindow {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	
+
 	if w.registered {
 		w.client.logger.Printf("Cannot modify registered window")
 		return w
 	}
-	
+
 	w.query = query
 	w.forceOpts = opts
 	return w
@@ -569,27 +594,27 @@ func (w *ActionWindow) SetForce(query string, opts ...ForceOption) *ActionWindow
 func (w *ActionWindow) Register() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	
+
 	if w.registered {
 		return errors.New("window already registered")
 	}
 	if len(w.actions) == 0 {
 		return errors.New("no actions in window")
 	}
-	
+
 	w.registered = true
-	
+
 	// Register actions
 	if err := w.client.RegisterActions(w.actions); err != nil {
 		return fmt.Errorf("failed to register actions: %w", err)
 	}
-	
+
 	// Get action names
 	names := make([]string, len(w.actions))
 	for i, a := range w.actions {
 		names[i] = a.GetName()
 	}
-	
+
 	// Force actions after a brief delay to ensure registration completes
 	go func() {
 		time.Sleep(100 * time.Millisecond)
@@ -597,7 +622,7 @@ func (w *ActionWindow) Register() error {
 			w.client.logger.Printf("Failed to force actions: %v", err)
 		}
 	}()
-	
+
 	return nil
 }
 
@@ -605,151 +630,15 @@ func (w *ActionWindow) Register() error {
 func (w *ActionWindow) End() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	
+
 	if !w.registered {
 		return nil
 	}
-	
+
 	names := make([]string, len(w.actions))
 	for i, a := range w.actions {
 		names[i] = a.GetName()
 	}
-	
+
 	return w.client.UnregisterActions(names)
 }
-
-// Example Usage:
-/*
-package main
-
-import (
-	"encoding/json"
-	"log"
-	"os"
-	"time"
-	
-	"your-module/neuro"
-)
-
-// Example: Tic Tac Toe Play Action
-type PlayAction struct {
-	game *TicTacToeGame
-}
-
-func (a *PlayAction) GetName() string {
-	return "play"
-}
-
-func (a *PlayAction) GetDescription() string {
-	return "Place an O in the specified cell."
-}
-
-func (a *PlayAction) GetSchema() *neuro.ActionSchema {
-	return neuro.WrapSchema(map[string]interface{}{
-		"cell": map[string]interface{}{
-			"type": "string",
-			"enum": a.game.GetAvailableCells(),
-		},
-	}, []string{"cell"})
-}
-
-func (a *PlayAction) Validate(data json.RawMessage) (interface{}, neuro.ExecutionResult) {
-	var params struct {
-		Cell string `json:"cell"`
-	}
-	
-	if err := neuro.ParseActionData(data, &params); err != nil {
-		return nil, neuro.NewFailureResult("Invalid action data")
-	}
-	
-	if params.Cell == "" {
-		return nil, neuro.NewFailureResult("Missing required parameter 'cell'")
-	}
-	
-	if !a.game.IsCellAvailable(params.Cell) {
-		return nil, neuro.NewFailureResult("Cell is not available")
-	}
-	
-	return params.Cell, neuro.NewSuccessResult("")
-}
-
-func (a *PlayAction) Execute(state interface{}) {
-	cell := state.(string)
-	a.game.PlayInCell(cell)
-}
-
-// Main Example
-func main() {
-	// Get websocket URL from environment
-	wsURL := os.Getenv("NEURO_SDK_WS_URL")
-	if wsURL == "" {
-		wsURL = "ws://localhost:8000"
-	}
-	
-	// Create client
-	client, err := neuro.NewClient(neuro.ClientConfig{
-		Game:         "Tic Tac Toe",
-		WebsocketURL: wsURL,
-	})
-	if err != nil {
-		log.Fatal(err)
-	}
-	
-	// Connect
-	if err := client.Connect(); err != nil {
-		log.Fatal(err)
-	}
-	defer client.Close()
-	
-	// Send initial context
-	client.SendContext("A Tic Tac Toe game has started. You are playing as O.", true)
-	
-	// Create game
-	game := NewTicTacToeGame(client)
-	
-	// Example: Force an action after player's turn
-	window := client.NewActionWindow()
-	window.AddAction(&PlayAction{game: game})
-	window.SetForce(
-		"It is your turn. Please place an O.",
-		neuro.WithPriority(neuro.PriorityLow),
-	)
-	
-	if err := window.Register(); err != nil {
-		log.Printf("Failed to register action window: %v", err)
-	}
-	
-	// Handle errors
-	go func() {
-		for err := range client.Errors() {
-			log.Printf("Error: %v", err)
-		}
-	}()
-	
-	// Keep running
-	select {}
-}
-
-// Simple action example without state
-type SimpleAction struct{}
-
-func (a *SimpleAction) GetName() string {
-	return "simple_action"
-}
-
-func (a *SimpleAction) GetDescription() string {
-	return "A simple action with no parameters"
-}
-
-func (a *SimpleAction) GetSchema() *neuro.ActionSchema {
-	return nil // No parameters
-}
-
-func (a *SimpleAction) Validate(data json.RawMessage) (interface{}, neuro.ExecutionResult) {
-	return nil, neuro.NewSuccessResult("")
-}
-
-func (a *SimpleAction) Execute(state interface{}) {
-	log.Println("Simple action executed!")
-}
-*/
