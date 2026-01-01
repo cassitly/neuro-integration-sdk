@@ -1,8 +1,26 @@
 package neuro_integration_sdk
 
 import (
+	"fmt"
   	"encoding/json"
+	"github.com/gorilla/websocket"
 )
+
+func NewNeuroIntegration(wsURL, gameName) (*NeuroIntegration, error) {
+	// Connect to Neuro WebSocket
+	ws, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to Neuro: %w", err)
+	}
+
+	integration := &NeuroIntegration{
+		ws:          ws,
+		gameName:    gameName,
+	}
+
+	return integration, nil
+}
+
 
 func (n *NeuroIntegration) sendMessage(msg NeuroMessage) error {
 	msg.Game = n.gameName
