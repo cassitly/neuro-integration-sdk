@@ -23,6 +23,8 @@ type Message struct {
 }
 
 // ActionSchema represents a JSON schema for action parameters
+// Note: Must have Type "object" if provided. Many JSON schema keywords are not supported.
+// See: https://github.com/VedalAI/neuro-sdk/blob/main/API/SPECIFICATION.md#action
 type ActionSchema struct {
 	Type       string                 `json:"type"`
 	Properties map[string]interface{} `json:"properties,omitempty"`
@@ -38,9 +40,10 @@ type ActionDefinition struct {
 
 // IncomingAction represents an action sent by Neuro
 type IncomingAction struct {
-	ID   string          `json:"id"`
-	Name string          `json:"name"`
-	Data json.RawMessage `json:"data,omitempty"`
+	ID   string `json:"id"`
+	Name string `json:"name"`
+	// Data is JSON-stringified action parameters (not raw JSON)
+	Data string `json:"data,omitempty"`
 }
 
 // ExecutionResult represents the result of validating/executing an action
@@ -72,14 +75,18 @@ const (
 // Action Handler Interface
 
 // ActionHandler defines the interface for handling actions
+// Important: Neuro can call actions at any time after registration,
+// even before you send an action force. Always be prepared to handle actions.
 type ActionHandler interface {
 	// GetName returns the unique identifier for this action
 	GetName() string
 	// GetDescription returns a description of what this action does
 	GetDescription() string
 	// GetSchema returns the JSON schema for action parameters (can be nil)
+	// If provided, schema must have Type "object"
 	GetSchema() *ActionSchema
 	// Validate checks if the incoming action data is valid
+	// Data comes directly from Neuro and may be malformed - always validate!
 	Validate(data json.RawMessage) (state interface{}, result ExecutionResult)
 	// Execute performs the actual action using the validated state
 	Execute(state interface{})
@@ -98,9 +105,9 @@ type ClientConfig struct {
 
 // Client manages the websocket connection to Neuro
 type Client struct {
-	config   ClientConfig
-	conn     *websocket.Conn
-	connMu   sync.RWMutex
+	config ClientConfig
+	conn   *websocket.Conn
+	connMu sync.RWMutex
 
 	// Registered actions
 	actions   map[string]ActionHandler
@@ -241,8 +248,19 @@ func (c *Client) handleAction(action IncomingAction) {
 		return
 	}
 
-	// Validate
-	state, result := handler.Validate(action.Data)
+	// Parse the JSON-stringified data from Neuro
+	var actionData json.RawMessage
+	if action.Data != "" {
+		// Data comes as a JSON string, need to parse it
+		if err := json.Unmarshal([]byte(action.Data), &actionData); err != nil {
+			c.logger.Printf("Failed to parse action data JSON: %v", err)
+			c.SendActionResult(action.ID, false, "Invalid JSON in action data")
+			return
+		}
+	}
+
+	// Validate (data may be malformed or not match schema)
+	state, result := handler.Validate(actionData)
 
 	// Send result immediately after validation
 	if err := c.SendActionResult(action.ID, result.Successful, result.Message); err != nil {
@@ -505,6 +523,7 @@ func (c *Client) Close() error {
 // Helper Functions
 
 // WrapSchema wraps properties into a proper JSON schema object
+// The resulting schema will have Type "object" as required by the Neuro API
 func WrapSchema(properties map[string]interface{}, required []string) *ActionSchema {
 	return &ActionSchema{
 		Type:       "object",
@@ -514,6 +533,7 @@ func WrapSchema(properties map[string]interface{}, required []string) *ActionSch
 }
 
 // ParseActionData is a helper to parse action data into a struct
+// Note: Data from Neuro may be malformed - always check the error
 func ParseActionData(data json.RawMessage, v interface{}) error {
 	if len(data) == 0 {
 		return nil

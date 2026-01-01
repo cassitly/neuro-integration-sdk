@@ -16,7 +16,7 @@ A production-ready Go SDK for integrating games and applications with Neuro-sama
 ## Installation
 
 ```bash
-go get github.com/cassitly/neuro-integration-sdk
+go get github.com/yourusername/neuro-integration-sdk
 ```
 
 ### Dependencies
@@ -289,14 +289,50 @@ type ActionHandler interface {
 
 - `NEURO_SDK_WS_URL` - WebSocket URL (default: `ws://localhost:8000`)
 
+## Important: Race Conditions & Action Timing
+
+⚠️ **Critical**: Neuro can execute actions at **any time** after registration, even before you send an action force. Your action handlers must always be ready to handle actions.
+
+### Recommendations from Official API Guide:
+
+1. **Always listen for actions** - Don't assume actions only arrive after forcing
+2. **Unregister disposable actions before sending result** - For turn-based games, unregister actions like "play_card" immediately in the Validate method, before returning the result
+3. **Be careful with non-disposable actions** - If forcing actions that can be used multiple times, handle the possibility that Neuro might use them immediately before or after the force
+
+### Action Windows Handle This Automatically
+
+Action windows are designed to handle these race conditions for you in turn-based games by:
+- Registering actions only when needed
+- Automatically unregistering when done
+- Managing the force/response lifecycle
+
+## JSON Schema Limitations
+
+The Neuro API has **limited JSON schema support**. The following keywords are probably **NOT supported**:
+
+`$anchor`, `$comment`, `$defs`, `$dynamicAnchor`, `$dynamicRef`, `$id`, `$ref`, `$schema`, `$vocabulary`, `additionalProperties`, `allOf`, `anyOf`, `contentEncoding`, `contentMediaType`, `contentSchema`, `dependentRequired`, `dependentSchemas`, `deprecated`, `description`, `else`, `if`, `maxProperties`, `minProperties`, `multipleOf`, `not`, `oneOf`, `patternProperties`, `readOnly`, `then`, `title`, `unevaluatedItems`, `unevaluatedProperties`, `writeOnly`
+
+**Note**: `uniqueItems` support is unknown - perform your own validation if you need it.
+
+### Supported Keywords
+
+Stick to these basic keywords:
+- `type`, `properties`, `required`
+- `enum`, `minimum`, `maximum`
+- `minLength`, `maxLength`
+- `pattern` (basic regex)
+- `items` (for arrays)
+- `default`
+
 ## Best Practices
 
-1. **Always validate parameters** in the `Validate` method before execution
+1. **Always validate parameters** - Data from Neuro may be malformed or not match your schema
 2. **Return meaningful messages** in `ExecutionResult` to help debug issues
 3. **Keep Execute fast** - offload heavy work to background goroutines if needed
 4. **Use action windows** for temporary, turn-based actions
 5. **Handle errors** by listening to the error channel
 6. **Clean up resources** with `defer client.Close()` and `defer window.End()`
+7. **Validate even with schemas** - The API cannot guarantee schema compliance
 
 ## Thread Safety
 
