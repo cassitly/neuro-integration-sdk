@@ -1,4 +1,4 @@
-package main
+package neuro_integration_sdk
 
 import (
 	"encoding/json"
