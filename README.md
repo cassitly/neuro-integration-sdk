@@ -16,7 +16,7 @@ A production-ready Go SDK for integrating games and applications with Neuro-sama
 ## Installation
 
 ```bash
-go get github.com/yourusername/neuro-integration-sdk
+go get github.com/cassitly/neuro-integration-sdk
 ```
 
 ### Dependencies
