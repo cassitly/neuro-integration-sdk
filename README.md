@@ -32,7 +32,7 @@ package main
 
 import (
     "log"
-    "github.com/yourusername/neuro-integration-sdk"
+    "github.com/cassitly/neuro-integration-sdk"
 )
 
 func main() {
