@@ -167,10 +167,21 @@ func (c *Client) Connect() error {
 		return fmt.Errorf("invalid websocket URL: %w", err)
 	}
 
-	conn, _, err := websocket.DefaultDialer.Dial(u.String(), nil)
+	c.logger.Printf("Connecting to %s...", u.String())
+
+	// Set connection timeout to prevent hanging
+	dialer := *websocket.DefaultDialer
+	dialer.HandshakeTimeout = 10 * time.Second
+
+	conn, resp, err := dialer.Dial(u.String(), nil)
 	if err != nil {
+		if resp != nil {
+			return fmt.Errorf("failed to connect (HTTP %d): %w", resp.StatusCode, err)
+		}
 		return fmt.Errorf("failed to connect: %w", err)
 	}
+
+	c.logger.Printf("WebSocket connection established")
 
 	c.conn = conn
 	c.connected = true
@@ -181,7 +192,10 @@ func (c *Client) Connect() error {
 	// Send startup message
 	if err := c.Startup(); err != nil {
 		c.logger.Printf("Failed to send startup message: %v", err)
+		return fmt.Errorf("failed to send startup: %w", err)
 	}
+
+	c.logger.Printf("Startup message sent successfully")
 
 	return nil
 }
@@ -189,18 +203,23 @@ func (c *Client) Connect() error {
 // Message Reading
 
 func (c *Client) readLoop() {
+	c.logger.Printf("Read loop started")
 	for {
 		select {
 		case <-c.closeChan:
+			c.logger.Printf("Read loop stopping (close signal)")
 			return
 		default:
 			_, msgBytes, err := c.conn.ReadMessage()
 			if err != nil {
 				if !c.closed {
+					c.logger.Printf("Read error: %v", err)
 					c.errChan <- fmt.Errorf("read error: %w", err)
 				}
 				return
 			}
+
+			c.logger.Printf("Received message: %s", string(msgBytes))
 
 			if err := c.handleMessage(msgBytes); err != nil {
 				c.logger.Printf("Error handling message: %v", err)
@@ -215,7 +234,7 @@ func (c *Client) handleMessage(msgBytes []byte) error {
 		return fmt.Errorf("failed to parse message: %w", err)
 	}
 
-	c.logger.Printf("Received: %s", msg.Command)
+	c.logger.Printf("Received command: %s", msg.Command)
 
 	switch msg.Command {
 	case "action":
@@ -228,6 +247,7 @@ func (c *Client) handleMessage(msgBytes []byte) error {
 		go c.handleAction(action)
 
 	case "actions/reregister_all":
+		c.logger.Printf("Received reregister_all request")
 		// Resend all registered actions
 		go c.resendRegisteredActions()
 
@@ -244,9 +264,12 @@ func (c *Client) handleAction(action IncomingAction) {
 	c.actionsMu.RUnlock()
 
 	if !exists {
+		c.logger.Printf("Unknown action: %s", action.Name)
 		c.SendActionResult(action.ID, false, fmt.Sprintf("Unknown action: %s", action.Name))
 		return
 	}
+
+	c.logger.Printf("Handling action: %s (ID: %s)", action.Name, action.ID)
 
 	// Parse the JSON-stringified data from Neuro
 	var actionData json.RawMessage
@@ -262,6 +285,8 @@ func (c *Client) handleAction(action IncomingAction) {
 	// Validate (data may be malformed or not match schema)
 	state, result := handler.Validate(actionData)
 
+	c.logger.Printf("Action validation result: success=%v, message=%s", result.Successful, result.Message)
+
 	// Send result immediately after validation
 	if err := c.SendActionResult(action.ID, result.Successful, result.Message); err != nil {
 		c.logger.Printf("Failed to send action result: %v", err)
@@ -269,6 +294,7 @@ func (c *Client) handleAction(action IncomingAction) {
 
 	// Execute if successful
 	if result.Successful {
+		c.logger.Printf("Executing action: %s", action.Name)
 		handler.Execute(state)
 	}
 }
@@ -290,16 +316,18 @@ func (c *Client) send(msg Message) error {
 		return fmt.Errorf("failed to marshal message: %w", err)
 	}
 
+	c.logger.Printf("Sending: %s - %s", msg.Command, string(msgBytes))
+
 	if err := c.conn.WriteMessage(websocket.TextMessage, msgBytes); err != nil {
 		return fmt.Errorf("failed to send message: %w", err)
 	}
 
-	c.logger.Printf("Sent: %s", msg.Command)
 	return nil
 }
 
 // Startup sends the initial startup message
 func (c *Client) Startup() error {
+	c.logger.Printf("Sending startup message...")
 	return c.send(Message{Command: "startup"})
 }
 
@@ -359,6 +387,8 @@ func (c *Client) RegisterActions(handlers []ActionHandler) error {
 	}
 	dataBytes, _ := json.Marshal(data)
 
+	c.logger.Printf("Registering %d action(s)", len(actions))
+
 	return c.send(Message{
 		Command: "actions/register",
 		Data:    dataBytes,
@@ -403,6 +433,7 @@ func (c *Client) resendRegisteredActions() {
 	c.actionsMu.RUnlock()
 
 	if len(handlers) > 0 {
+		c.logger.Printf("Re-registering %d action(s)", len(handlers))
 		if err := c.RegisterActions(handlers); err != nil {
 			c.logger.Printf("Failed to resend registered actions: %v", err)
 		}
@@ -510,6 +541,7 @@ func (c *Client) Close() error {
 		return nil
 	}
 
+	c.logger.Printf("Closing client...")
 	c.closed = true
 	close(c.closeChan)
 
@@ -618,6 +650,7 @@ func (w *ActionWindow) Register() error {
 	// Force actions after a brief delay to ensure registration completes
 	go func() {
 		time.Sleep(100 * time.Millisecond)
+		w.client.logger.Printf("Forcing actions in window: %v", names)
 		if err := w.client.ForceActions(w.query, names, w.forceOpts...); err != nil {
 			w.client.logger.Printf("Failed to force actions: %v", err)
 		}
