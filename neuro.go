@@ -153,7 +153,6 @@ func NewClient(config ClientConfig) (*Client, error) {
 // Connect establishes the websocket connection and starts the message loop
 func (c *Client) Connect() error {
 	c.connMu.Lock()
-	defer c.connMu.Unlock()
 
 	if c.closed {
 		return errors.New("client is closed")
@@ -189,6 +188,10 @@ func (c *Client) Connect() error {
 	// Start reader goroutine
 	go c.readLoop()
 
+	// CRITICAL: Unlock BEFORE calling Startup() to avoid deadlock
+	// Startup() calls send() which needs to acquire a read lock
+	c.connMu.Unlock()
+	
 	// Send startup message
 	if err := c.Startup(); err != nil {
 		c.logger.Printf("Failed to send startup message: %v", err)
