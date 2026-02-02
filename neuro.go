@@ -328,7 +328,7 @@ func (c *Client) send(msg Message) error {
 // Startup sends the initial startup message
 func (c *Client) Startup() error {
 	c.logger.Printf("Sending startup message...")
-	return c.send(Message{Command: "startup"})
+	return c.send(Message{Command: "startup", Game: c.config.Game})
 }
 
 // SendContext sends a context message to Neuro
