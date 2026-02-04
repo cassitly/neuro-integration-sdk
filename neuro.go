@@ -290,9 +290,11 @@ func (c *Client) handleAction(action IncomingAction) {
 
 	c.logger.Printf("Action validation result: success=%v, message=%s", result.Successful, result.Message)
 
-	// Send result immediately after validation
-	if err := c.SendActionResult(action.ID, result.Successful, result.Message); err != nil {
-		c.logger.Printf("Failed to send action result: %v", err)
+	// Send result immediately if validation failed
+	if !result.Successful {
+		if err := c.SendActionResult(action.ID, result.Successful, result.Message); err != nil {
+			c.logger.Printf("Failed to send action result: %v", err)
+		}
 	}
 
 	// Execute if successful
